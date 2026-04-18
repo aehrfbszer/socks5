@@ -1,7 +1,10 @@
-use clap::Parser;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use clap::{Parser, builder::Str};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    select, time::{timeout, Duration},
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -10,29 +13,22 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value_t)]
+    #[arg(short, long, default_value = "[::]")]
     listen_addr: String,
     #[arg(short, long, default_value_t)]
     auth: bool,
-    #[arg(short, long, default_value_t)]
+    #[arg(short, long, default_value_t = 1080)]
     port: u16,
-    #[arg(required_if_eq("auth", "true"), short, long)]
+    #[arg(required_if_eq("auth", "true"), long)]
     username: Option<String>,
-    #[arg(required_if_eq("auth", "true"), short, long)]
+    #[arg(required_if_eq("auth", "true"), long)]
     password: Option<String>,
 }
 
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            listen_addr: "0.0.0.0".into(),
-            auth: false,
-            port: 1080,
-            username: None,
-            password: None,
-        }
-    }
-}
+const RANDOM_ADDR: [SocketAddr; 2] = [
+    SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), 0),
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
+];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,6 +42,7 @@ async fn main() -> Result<()> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+    tracing::info!("Starting SOCKS5 server with config: {:?}", config);
 
     // 监听本地 8080 端口
     let listener = TcpListener::bind(format!("{}:{}", config.listen_addr, config.port)).await?;
@@ -92,27 +89,79 @@ const REP_TTL_EXPIRED: u8 = 0x06;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
-fn build_reply(rep: u8, bind_addr: &str, bind_port: u16) -> Vec<u8> {
-    let mut reply = vec![
+fn build_reply_data(rep: u8, addr_info: &[u8], port: u16) -> Vec<u8> {
+    let mut res = vec![
         SOCKS5_VERSION,
         rep,
         0x00, // RSV
     ];
 
-    if let Ok(ip) = bind_addr.parse::<std::net::Ipv4Addr>() {
-        reply.push(ATYP_IPV4);
-        reply.extend_from_slice(&ip.octets());
-    } else if let Ok(ip) = bind_addr.parse::<std::net::Ipv6Addr>() {
-        reply.push(ATYP_IPV6);
-        reply.extend_from_slice(&ip.octets());
-    } else {
-        reply.push(ATYP_DOMAIN);
-        reply.push(bind_addr.len() as u8);
-        reply.extend_from_slice(bind_addr.as_bytes());
-    }
+    res.extend_from_slice(addr_info);
+    res.extend_from_slice(&port.to_be_bytes());
+    res
+}
 
-    reply.extend_from_slice(&bind_port.to_be_bytes());
-    reply
+fn build_reply_with_ip(rep: u8, ip: std::net::IpAddr, port: u16) -> Vec<u8> {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let mut buf = [0u8; 5];
+            buf[0] = ATYP_IPV4;
+            buf[1..5].copy_from_slice(&ipv4.octets());
+            return build_reply_data(rep, &buf, port);
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            let mut buf = [0u8; 17];
+            buf[0] = ATYP_IPV6;
+            buf[1..17].copy_from_slice(&ipv6.octets());
+            return build_reply_data(rep, &buf, port);
+        }
+    }
+}
+
+fn build_reply(rep: u8, bind_addr: &str, bind_port: u16) -> Vec<u8> {
+    if let Ok(ip) = bind_addr.parse::<std::net::Ipv4Addr>() {
+        return build_reply_with_ip(rep, std::net::IpAddr::V4(ip), bind_port);
+    } else if let Ok(ip) = bind_addr.parse::<std::net::Ipv6Addr>() {
+        return build_reply_with_ip(rep, std::net::IpAddr::V6(ip), bind_port);
+    } else {
+        let mut buf = vec![ATYP_DOMAIN, bind_addr.len() as u8];
+        buf.extend_from_slice(bind_addr.as_bytes());
+        return build_reply_data(rep, &buf, bind_port);
+    }
+}
+
+async fn read_address_and_port<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<(String, u16, u16)> {
+    let atyp = reader.read_u8().await?;
+    let mut offset: u16 = 0;
+    let addr = match atyp {
+        ATYP_IPV4 => {
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf).await?;
+            offset += 4;
+            std::net::Ipv4Addr::from(buf).to_string()
+        }
+        ATYP_IPV6 => {
+            let mut buf = [0u8; 16];
+            reader.read_exact(&mut buf).await?;
+            offset += 16;
+            std::net::Ipv6Addr::from(buf).to_string()
+        }
+        ATYP_DOMAIN => {
+            let len = reader.read_u8().await? as usize;
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf).await?;
+            offset += len as u16 + 1; // Account for the length byte
+
+            String::from_utf8(buf)?
+        }
+        _ => return Err("Unsupported address type".into()),
+    };
+
+    let port = reader.read_u16().await?;
+    offset += 2;
+    Ok((addr, port, offset))
 }
 
 async fn handle_socks5_client(
@@ -122,7 +171,6 @@ async fn handle_socks5_client(
     config_password: &'static str,
 ) -> Result<()> {
     // 这里我们会维护一个状态机来处理 SOCKS5 协议的不同阶段
-    let mut state = SocksState::default();
 
     let mut buf = [0u8; 2];
     socket.read_exact(&mut buf).await?;
@@ -145,11 +193,6 @@ async fn handle_socks5_client(
 
     if methods.contains(&method) {
         socket.write_all(&[SOCKS5_VERSION, method]).await?;
-        state.stage = if need_auth {
-            Stage::Authentication
-        } else {
-            Stage::Connected
-        };
     } else {
         socket
             .write_all(&[SOCKS5_VERSION, NO_ACCEPTABLE_METHODS])
@@ -158,7 +201,7 @@ async fn handle_socks5_client(
         return Ok(());
     }
 
-    if state.stage == Stage::Authentication {
+    if need_auth {
         // 处理用户名密码认证
         let mut auth_buf = [0u8; 2];
         socket.read_exact(&mut auth_buf).await?;
@@ -183,13 +226,13 @@ async fn handle_socks5_client(
             return Ok(());
         } else {
             socket.write_all(&[0x01, 0x00]).await?;
-            state.stage = Stage::Connected;
+            // stage = Stage::Connected;
         }
     }
 
-    tracing::info!(?state.stage, "Client authenticated successfully, waiting for command");
+    tracing::info!("Client handshake successfully, waiting for command");
 
-    let mut cmd_buf = [0u8; 4];
+    let mut cmd_buf = [0u8; 3];
     socket.read_exact(&mut cmd_buf).await?;
     if cmd_buf[0] != SOCKS5_VERSION {
         tracing::error!("Unsupported SOCKS version in command: {}", cmd_buf[0]);
@@ -199,13 +242,168 @@ async fn handle_socks5_client(
 
     match cmd_buf[1] {
         CMD_CONNECT => {
-            state.cmd = Some(Cmd::Connect);
+            let (target_addr, target_port, _) = read_address_and_port(&mut socket).await?;
+            tracing::info!(
+                ?target_addr,
+                ?target_port,
+                "Client requested CONNECT command"
+            );
+            let mut tcp_client =
+                tokio::net::TcpStream::connect(format!("{}:{}", target_addr, target_port)).await?;
+            let local_addr = socket.local_addr()?;
+
+            socket
+                .write_all(&build_reply_with_ip(
+                    REP_SUCCEEDED,
+                    local_addr.ip(),
+                    local_addr.port(),
+                ))
+                .await?;
+
+            let (mut socket_reader, mut socket_writer) = socket.split();
+            let (mut tcp_reader, mut tcp_writer) = tcp_client.split();
+
+            let client_to_remote = tokio::io::copy(&mut socket_reader, &mut tcp_writer);
+            let remote_to_client = tokio::io::copy(&mut tcp_reader, &mut socket_writer);
+
+            tokio::try_join!(client_to_remote, remote_to_client)?;
         }
         CMD_BIND => {
-            state.cmd = Some(Cmd::Bind);
+            let addrs: &[SocketAddr] = &RANDOM_ADDR;
+
+            let bind_listener = TcpListener::bind(addrs).await?;
+
+            let local_addr = bind_listener.local_addr()?;
+            socket
+                .write_all(&build_reply_with_ip(
+                    REP_SUCCEEDED,
+                    local_addr.ip(),
+                    local_addr.port(),
+                ))
+                .await?;
+
+            // 只处理一个连接，之后关闭
+            if let Ok((mut remote, remote_addr)) = bind_listener.accept().await {
+                tracing::info!(
+                    ?remote_addr,
+                    "Received incoming connection for BIND command"
+                );
+                socket
+                    .write_all(&build_reply_with_ip(
+                        REP_SUCCEEDED,
+                        remote_addr.ip(),
+                        remote_addr.port(),
+                    ))
+                    .await?;
+                let (mut socket_reader, mut socket_writer) = socket.split();
+                let (mut remote_reader, mut remote_writer) = remote.split();
+
+                let client_to_remote = tokio::io::copy(&mut socket_reader, &mut remote_writer);
+                let remote_to_client = tokio::io::copy(&mut remote_reader, &mut socket_writer);
+
+                // tokio::select! {
+                //     res = client_to_remote => {
+                //         if let Err(e) = res {
+                //             tracing::error!(?e, "Error forwarding data from client to remote");
+                //         }
+                //     }
+                //     res = remote_to_client => {
+                //         if let Err(e) = res {
+                //             tracing::error!(?e, "Error forwarding data from remote to client");
+                //         }
+                //     }
+                // }
+                tokio::try_join!(client_to_remote, remote_to_client)?;
+            } else {
+                tracing::error!("Failed to accept incoming connection for BIND command");
+            }
         }
         CMD_UDP_ASSOCIATE => {
-            state.cmd = Some(Cmd::UdpAssociate);
+            let addrs: &[SocketAddr] = &RANDOM_ADDR;
+            let udp_socket = tokio::net::UdpSocket::bind(addrs).await?;
+            let local_addr = udp_socket.local_addr()?;
+            socket
+                .write_all(&build_reply_with_ip(
+                    REP_SUCCEEDED,
+                    local_addr.ip(),
+                    local_addr.port(),
+                ))
+                .await?;
+            tracing::info!(
+                ?local_addr,
+                "UDP associate established, waiting for UDP packets"
+            );
+            let mut buf = [0u8; 65535];
+            // 设置 UDP 循环的超时时间（10分钟无数据活动则关闭）
+            let timeout_duration = Duration::from_secs(600);
+            
+            loop {
+                match timeout(timeout_duration, udp_socket.recv_from(&mut buf)).await {
+                    Ok(Ok((len, client_addr))) => {
+                        tracing::info!(?client_addr, "Received UDP packet from client");
+
+                        let data = &buf[..len];
+                        if data.len() < 4 || data[0] != 0x00 || data[1] != 0x00 || data[2] != 0x00 {
+                            tracing::error!("Invalid UDP packet format");
+                            continue;
+                        }
+                        let (target_addr, target_port, offset) =
+                            match read_address_and_port(&mut &data[3..]).await {
+                                Ok(res) => res,
+                                Err(e) => {
+                                    tracing::error!(
+                                        ?e,
+                                        "Failed to parse target address and port from UDP packet"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                        let remote_udp = tokio::net::UdpSocket::bind(addrs).await?;
+                        remote_udp
+                            .connect(format!("{}:{}", target_addr, target_port))
+                            .await?;
+
+                        let mut new_buf = [0u8; 65535];
+                        let data_offset = offset as usize + 3;
+
+                        select! {
+                            res = remote_udp.send(&data[data_offset..]) => {
+                                if let Err(e) = res {
+                                    tracing::error!(?e, "Failed to send UDP packet to target");
+                                } else {
+                                    tracing::info!(?target_addr, ?target_port, "Forwarded UDP packet to target");
+                                }
+                            }
+                            res = remote_udp.recv(&mut new_buf) => {
+                                match res {
+                                    Ok(len) => {
+                                        tracing::info!(?target_addr, ?target_port, "Received UDP response from target");
+                                        let mut response = vec![0x00, 0x00, 0x00]; // RSV
+                                        response.extend_from_slice(&data[3..data_offset]); // ATYP + DST.ADDR + DST.PORT
+                                        response.extend_from_slice(&new_buf[..len]); // DATA
+                                        if let Err(e) = udp_socket.send_to(&response, &client_addr).await {
+                                            tracing::error!(?e, "Failed to send UDP response back to client");
+                                        } else {
+                                            tracing::info!(?client_addr, "Sent UDP response back to client");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(?e, "Failed to receive UDP response from target");
+                                    }
+                                }
+                            }}
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(?e, "UDP receive error");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!("UDP session timeout, closing connection");
+                        break;
+                    }
+                }
+            }
         }
         _ => {
             tracing::error!("Unsupported command: {}", cmd_buf[1]);
@@ -217,31 +415,5 @@ async fn handle_socks5_client(
         }
     }
 
-    tracing::info!("Client is fully connected and ready to proxy data");
     Ok(())
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-enum Stage {
-    #[default]
-    Handshake,
-    Authentication,
-    Connected,
-}
-
-#[derive(Debug)]
-enum Cmd {
-    Connect,
-    Bind,
-    UdpAssociate,
-}
-
-#[derive(Debug, Default)]
-struct SocksState {
-    stage: Stage,
-    ready: bool,
-    cmd: Option<Cmd>,
-    tcp_socket: Option<tokio::net::TcpStream>,
-    udp_socket: Option<tokio::net::UdpSocket>,
-    bind_socket: Option<tokio::net::TcpListener>,
 }
