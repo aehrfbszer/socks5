@@ -6,7 +6,6 @@ use clap::Parser;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    select,
     time::{Duration, timeout},
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -144,7 +143,7 @@ async fn udp_forward_task(
     atyp_and_addr: Vec<u8>, // ATYP + DST.ADDR + DST.PORT
     mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
-    let remote_udp = tokio::net::UdpSocket::bind(&RANDOM_ADDR[..]).await?;
+    let remote_udp = Arc::new(tokio::net::UdpSocket::bind(&RANDOM_ADDR[..]).await?);
     tracing::info!(
         ?client_addr,
         ?target_addr,
@@ -155,54 +154,64 @@ async fn udp_forward_task(
         .connect(format!("{}:{}", target_addr, target_port))
         .await?;
 
-    let mut recv_buf = [0u8; 65535];
-    let timeout_duration = Duration::from_secs(1); // 单个连接 1 秒超时
-
-    loop {
-        select! {
-            // 接收来自客户端的数据
-            res = rx.recv() => {
-                let data = match res {
-                    Some(d) => d,
-                    None => {
-                        tracing::debug!("Forward channel closed for {:?}", client_addr);
-                        break;
-                    }
-                };
-                if let Err(e) = remote_udp.send(&data).await {
-                    tracing::error!(?e, "Failed to send UDP packet to target");
-                    break;
-                }else {
-                    let msg = String::from_utf8_lossy(&data);
-                    tracing::info!(?msg, "Forwarded UDP packet to target");
-                }
+    // 任务1: 接收来自客户端的数据并转发到目标
+    let remote_udp_clone1 = Arc::clone(&remote_udp);
+    let task_send = async {
+        while let Some(data) = rx.recv().await {
+            if let Err(e) = remote_udp_clone1.send(&data).await {
+                tracing::error!(?e, "Failed to send UDP packet to target");
+                return Err::<(), String>(e.to_string());
             }
-            // 接收来自目标的响应
-            res = timeout(timeout_duration, remote_udp.recv(&mut recv_buf)) => {
-                match res {
-                    Ok(Ok(len)) => {
-                        let msg = String::from_utf8_lossy(&recv_buf[..len]);
-                        tracing::info!(?msg, "Received UDP response from target");
-                        let mut response = vec![0x00, 0x00, 0x00]; // RSV
-                        response.extend_from_slice(&atyp_and_addr);
-                        response.extend_from_slice(&recv_buf[..len]);
-                        if let Err(e) = udp_socket.send_to(&response, &client_addr).await {
-                            tracing::error!(?e, "Failed to send UDP response to client");
-                            break;
-                        }
+            tracing::debug!("Forwarded UDP packet to target");
+        }
+        // 客户端通道关闭
+        Ok(())
+    };
+
+    // 任务2: 接收来自目标的响应并转发回客户端
+    let remote_udp_clone2 = Arc::clone(&remote_udp);
+    let udp_socket_clone = Arc::clone(&udp_socket);
+    let atyp_and_addr_clone = atyp_and_addr.clone();
+    let task_recv = async {
+        let mut recv_buf = [0u8; 65535];
+        let timeout_duration = Duration::from_secs(30); // 单个响应 30 秒超时
+
+        loop {
+            match timeout(timeout_duration, remote_udp_clone2.recv(&mut recv_buf)).await {
+                Ok(Ok(len)) => {
+                    tracing::debug!("Received UDP response from target, len={}", len);
+                    let mut response = vec![0x00, 0x00, 0x00]; // RSV
+                    response.extend_from_slice(&atyp_and_addr_clone);
+                    response.extend_from_slice(&recv_buf[..len]);
+                    if let Err(e) = udp_socket_clone.send_to(&response, &client_addr).await {
+                        tracing::error!(?e, "Failed to send UDP response to client");
+                        return Err::<(), String>(e.to_string());
                     }
-                    Ok(Err(e)) => {
-                        tracing::error!(?e, "UDP receive from target error");
-                        break;
-                    }
-                    Err(_) => {
-                        tracing::debug!("UDP forward task timeout for {:?}", client_addr);
-                        break;
-                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(?e, "UDP receive from target error");
+                    return Err(e.to_string());
+                }
+                Err(_) => {
+                    // 30秒无数据，认为会话已结束
+                    tracing::debug!("UDP forward task: recv timeout");
+                    return Ok(());
                 }
             }
         }
+    };
+
+    // 并发运行两个任务，等待两个都完成
+    // 如果有一个出错，整体返回错误；都成功则返回 Ok
+    match tokio::join!(task_send, task_recv) {
+        (Ok(()), Ok(())) => {
+            tracing::info!("UDP forward task completed normally");
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::error!("UDP forward task error: {}", e);
+        }
     }
+
     tracing::info!(
         ?client_addr,
         ?target_addr,
@@ -210,6 +219,59 @@ async fn udp_forward_task(
         "UDP forward task ended"
     );
     Ok(())
+}
+
+fn parse_udp_address_and_port(data: &[u8]) -> Result<(String, u16, u16)> {
+    if data.is_empty() {
+        return Err("Not enough data to parse address type".into());
+    }
+    
+    let mut offset = 0usize;
+    let atyp = data[offset];
+    offset += 1;
+
+    let addr = match atyp {
+        ATYP_IPV4 => {
+            if data.len() < offset + 4 {
+                return Err("Not enough data for IPv4 address".into());
+            }
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(&data[offset..offset + 4]);
+            offset += 4;
+            std::net::Ipv4Addr::from(buf).to_string()
+        }
+        ATYP_IPV6 => {
+            if data.len() < offset + 16 {
+                return Err("Not enough data for IPv6 address".into());
+            }
+            let mut buf = [0u8; 16];
+            buf.copy_from_slice(&data[offset..offset + 16]);
+            offset += 16;
+            std::net::Ipv6Addr::from(buf).to_string()
+        }
+        ATYP_DOMAIN => {
+            if data.len() < offset + 1 {
+                return Err("Not enough data for domain length".into());
+            }
+            let len = data[offset] as usize;
+            offset += 1;
+            if data.len() < offset + len {
+                return Err("Not enough data for domain name".into());
+            }
+            let domain = String::from_utf8(data[offset..offset + len].to_vec())?;
+            offset += len;
+            domain
+        }
+        _ => return Err(format!("Unsupported address type: {}", atyp).into()),
+    };
+
+    if data.len() < offset + 2 {
+        return Err("Not enough data for port".into());
+    }
+    let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
+    offset += 2;
+
+    Ok((addr, port, offset as u16))
 }
 
 async fn read_address_and_port<R: AsyncReadExt + Unpin>(
@@ -234,7 +296,7 @@ async fn read_address_and_port<R: AsyncReadExt + Unpin>(
             let len = reader.read_u8().await? as usize;
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf).await?;
-            offset += len as u16 + 1; // Account for the length byte
+            offset += len as u16 + 1;
 
             String::from_utf8(buf)?
         }
@@ -408,10 +470,8 @@ async fn handle_socks5_client(
             }
         }
         CMD_UDP_ASSOCIATE => {
-            let (target_addr, target_port, _) = read_address_and_port(&mut socket).await?;
+            // RFC 1928: UDP ASSOCIATE 请求中的地址信息应该被忽略，不读取
             tracing::info!(
-                ?target_addr,
-                ?target_port,
                 "Client requested UDP ASSOCIATE command, setting up UDP socket"
             );
             let udp_socket = Arc::new(tokio::net::UdpSocket::bind(&RANDOM_ADDR[..]).await?);
@@ -451,7 +511,7 @@ async fn handle_socks5_client(
                         }
 
                         let (target_addr, target_port, offset) =
-                            match read_address_and_port(&mut &data[3..]).await {
+                            match parse_udp_address_and_port(&data[3..]) {
                                 Ok(res) => res,
                                 Err(e) => {
                                     tracing::error!(
