@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 
-use clap::{Parser, builder::Str};
+use clap::Parser;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    select, time::{timeout, Duration},
+    select,
+    time::{Duration, timeout},
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -58,12 +61,14 @@ async fn main() -> Result<()> {
 
     loop {
         let (socket, addr) = listener.accept().await?;
-        tracing::info!(?addr, "New client connected");
+        tracing::info!(?addr, "[open]New client connected");
 
         // 每个连接 spawn 一个任务
         tokio::spawn(async move {
             if let Err(e) = handle_socks5_client(socket, config.auth, username, password).await {
-                tracing::error!(?e, "Error handling client");
+                tracing::error!(?addr, ?e, "[close]Error handling client");
+            } else {
+                tracing::info!(?addr, "[close]Client disconnected");
             }
         });
     }
@@ -128,6 +133,83 @@ fn build_reply(rep: u8, bind_addr: &str, bind_port: u16) -> Vec<u8> {
         buf.extend_from_slice(bind_addr.as_bytes());
         return build_reply_data(rep, &buf, bind_port);
     }
+}
+
+// UDP 转发任务：处理单个 (client_addr, target) 对的双向数据转发
+async fn udp_forward_task(
+    udp_socket: Arc<tokio::net::UdpSocket>,
+    client_addr: SocketAddr,
+    target_addr: String,
+    target_port: u16,
+    atyp_and_addr: Vec<u8>, // ATYP + DST.ADDR + DST.PORT
+    mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> Result<()> {
+    let remote_udp = tokio::net::UdpSocket::bind(&RANDOM_ADDR[..]).await?;
+    tracing::info!(
+        ?client_addr,
+        ?target_addr,
+        ?target_port,
+        "UDP forward task started"
+    );
+    remote_udp
+        .connect(format!("{}:{}", target_addr, target_port))
+        .await?;
+
+    let mut recv_buf = [0u8; 65535];
+    let timeout_duration = Duration::from_secs(1); // 单个连接 1 秒超时
+
+    loop {
+        select! {
+            // 接收来自客户端的数据
+            res = rx.recv() => {
+                let data = match res {
+                    Some(d) => d,
+                    None => {
+                        tracing::debug!("Forward channel closed for {:?}", client_addr);
+                        break;
+                    }
+                };
+                if let Err(e) = remote_udp.send(&data).await {
+                    tracing::error!(?e, "Failed to send UDP packet to target");
+                    break;
+                }else {
+                    let msg = String::from_utf8_lossy(&data);
+                    tracing::info!(?msg, "Forwarded UDP packet to target");
+                }
+            }
+            // 接收来自目标的响应
+            res = timeout(timeout_duration, remote_udp.recv(&mut recv_buf)) => {
+                match res {
+                    Ok(Ok(len)) => {
+                        let msg = String::from_utf8_lossy(&recv_buf[..len]);
+                        tracing::info!(?msg, "Received UDP response from target");
+                        let mut response = vec![0x00, 0x00, 0x00]; // RSV
+                        response.extend_from_slice(&atyp_and_addr);
+                        response.extend_from_slice(&recv_buf[..len]);
+                        if let Err(e) = udp_socket.send_to(&response, &client_addr).await {
+                            tracing::error!(?e, "Failed to send UDP response to client");
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(?e, "UDP receive from target error");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!("UDP forward task timeout for {:?}", client_addr);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    tracing::info!(
+        ?client_addr,
+        ?target_addr,
+        ?target_port,
+        "UDP forward task ended"
+    );
+    Ok(())
 }
 
 async fn read_address_and_port<R: AsyncReadExt + Unpin>(
@@ -198,6 +280,7 @@ async fn handle_socks5_client(
             .write_all(&[SOCKS5_VERSION, NO_ACCEPTABLE_METHODS])
             .await?;
         socket.shutdown().await?;
+        tracing::error!("No acceptable authentication methods offered by client");
         return Ok(());
     }
 
@@ -269,9 +352,15 @@ async fn handle_socks5_client(
             tokio::try_join!(client_to_remote, remote_to_client)?;
         }
         CMD_BIND => {
-            let addrs: &[SocketAddr] = &RANDOM_ADDR;
+            let (target_addr, target_port, _) = read_address_and_port(&mut socket).await?;
 
-            let bind_listener = TcpListener::bind(addrs).await?;
+            tracing::info!(
+                ?target_addr,
+                ?target_port,
+                "Client requested BIND command, setting up listener"
+            );
+
+            let bind_listener = TcpListener::bind(&RANDOM_ADDR[..]).await?;
 
             let local_addr = bind_listener.local_addr()?;
             socket
@@ -319,8 +408,13 @@ async fn handle_socks5_client(
             }
         }
         CMD_UDP_ASSOCIATE => {
-            let addrs: &[SocketAddr] = &RANDOM_ADDR;
-            let udp_socket = tokio::net::UdpSocket::bind(addrs).await?;
+            let (target_addr, target_port, _) = read_address_and_port(&mut socket).await?;
+            tracing::info!(
+                ?target_addr,
+                ?target_port,
+                "Client requested UDP ASSOCIATE command, setting up UDP socket"
+            );
+            let udp_socket = Arc::new(tokio::net::UdpSocket::bind(&RANDOM_ADDR[..]).await?);
             let local_addr = udp_socket.local_addr()?;
             socket
                 .write_all(&build_reply_with_ip(
@@ -333,11 +427,19 @@ async fn handle_socks5_client(
                 ?local_addr,
                 "UDP associate established, waiting for UDP packets"
             );
+
+            // 存储每个 (client_addr, target) 对应的转发通道
+            // Key: (client_addr, target_addr:port)
+            // Value: Sender<Vec<u8>>
+            let forward_channels: Arc<
+                Mutex<HashMap<(SocketAddr, String), tokio::sync::mpsc::Sender<Vec<u8>>>>,
+            > = Arc::new(Mutex::new(HashMap::new()));
+
             let mut buf = [0u8; 65535];
-            // 设置 UDP 循环的超时时间（10分钟无数据活动则关闭）
-            let timeout_duration = Duration::from_secs(600);
-            
+            let timeout_duration = Duration::from_secs(600); // 整个 UDP 会话 10 分钟超时
+
             loop {
+                // let forward_channels = Arc::clone(&forward_channels);
                 match timeout(timeout_duration, udp_socket.recv_from(&mut buf)).await {
                     Ok(Ok((len, client_addr))) => {
                         tracing::info!(?client_addr, "Received UDP packet from client");
@@ -347,6 +449,7 @@ async fn handle_socks5_client(
                             tracing::error!("Invalid UDP packet format");
                             continue;
                         }
+
                         let (target_addr, target_port, offset) =
                             match read_address_and_port(&mut &data[3..]).await {
                                 Ok(res) => res,
@@ -359,40 +462,61 @@ async fn handle_socks5_client(
                                 }
                             };
 
-                        let remote_udp = tokio::net::UdpSocket::bind(addrs).await?;
-                        remote_udp
-                            .connect(format!("{}:{}", target_addr, target_port))
-                            .await?;
+                        let forward_key = (client_addr, format!("{}:{}", target_addr, target_port));
+                        let data_to_send = data[(offset as usize + 3)..].to_vec();
+                        let atyp_and_addr = data[3..(offset as usize + 3)].to_vec();
 
-                        let mut new_buf = [0u8; 65535];
-                        let data_offset = offset as usize + 3;
+                        let res = forward_channels.lock().unwrap().get(&forward_key).cloned();
 
-                        select! {
-                            res = remote_udp.send(&data[data_offset..]) => {
-                                if let Err(e) = res {
-                                    tracing::error!(?e, "Failed to send UDP packet to target");
-                                } else {
-                                    tracing::info!(?target_addr, ?target_port, "Forwarded UDP packet to target");
-                                }
+                        // 检查是否已有该转发通道
+                        if let Some(tx) = res {
+                            // 通道已存在，直接发送数据
+                            if let Err(e) = tx.send(data_to_send).await {
+                                tracing::error!(?e, "Failed to send data to forward channel");
+                                forward_channels.lock().unwrap().remove(&forward_key);
+                            } else {
+                                tracing::info!(?client_addr, "Sent UDP packet to existing forward channel");
                             }
-                            res = remote_udp.recv(&mut new_buf) => {
-                                match res {
-                                    Ok(len) => {
-                                        tracing::info!(?target_addr, ?target_port, "Received UDP response from target");
-                                        let mut response = vec![0x00, 0x00, 0x00]; // RSV
-                                        response.extend_from_slice(&data[3..data_offset]); // ATYP + DST.ADDR + DST.PORT
-                                        response.extend_from_slice(&new_buf[..len]); // DATA
-                                        if let Err(e) = udp_socket.send_to(&response, &client_addr).await {
-                                            tracing::error!(?e, "Failed to send UDP response back to client");
-                                        } else {
-                                            tracing::info!(?client_addr, "Sent UDP response back to client");
+                        } else {
+                            // 创建新的转发通道和任务
+                            let (tx, rx) = tokio::sync::mpsc::channel(100);
+                            if tx.send(data_to_send).await.is_ok() {
+                                forward_channels
+                                    .lock()
+                                    .unwrap()
+                                    .insert(forward_key.clone(), tx.clone());
+
+                                // 启动后台转发任务
+                                let udp_socket_clone = Arc::clone(&udp_socket);
+                                let forward_channels_clone = Arc::clone(&forward_channels);
+
+                                tokio::spawn(async move {
+                                    match udp_forward_task(
+                                        udp_socket_clone,
+                                        client_addr,
+                                        target_addr,
+                                        target_port,
+                                        atyp_and_addr,
+                                        rx,
+                                    )
+                                    .await
+                                    {
+                                        Ok(_) => {
+                                            tracing::debug!(
+                                                "UDP forward task completed for {:?}",
+                                                forward_key
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(?e, "UDP forward task error");
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::error!(?e, "Failed to receive UDP response from target");
-                                    }
-                                }
-                            }}
+                                    // 清理通道
+                                    forward_channels_clone.lock().unwrap().remove(&forward_key);
+                                    tracing::info!(?forward_key, "Cleaned up forward channel");
+                                });
+                            }
+                        }
                     }
                     Ok(Err(e)) => {
                         tracing::error!(?e, "UDP receive error");
